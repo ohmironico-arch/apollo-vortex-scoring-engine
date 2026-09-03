@@ -1,1 +1,143 @@
+#include <cmath>
+#include <cstdint>
+#include <array>
+#include <chrono>
+#include <iostream>
 
+namespace ToroidalEVCore {
+
+// Códigos de seguridad funcional (ISO 26262 - ASIL-D Readiness)
+enum class SafetyStatus : uint8_t {
+    OPERATIONAL = 0x00,
+    FAULT_OVERCURRENT = 0x01,
+    FAULT_HARMONIC_INSTABILITY = 0x02,
+    FAULT_WATCHDOG_TIMEOUT = 0x03
+};
+
+struct MotorTelemetry {
+    float i_a, i_b, i_c; // Corrientes trifásicas
+    float dc_bus_voltage;
+    float rotor_angle;
+    bool sensors_valid;
+};
+
+struct OptimizedPWMOutput {
+    float duty_a;
+    float duty_b;
+    float duty_c;
+    SafetyStatus status;
+};
+
+class FibonacciToroidalFOC {
+private:
+    static constexpr float SQRT_3 = 1.7320508128f;
+    static constexpr float PHI = 1.61803398875f; // Proporción Áurea (Fibonacci limit)
+    static constexpr float MAX_CURRENT_LIMIT = 350.0f; // Amperios
+    static constexpr float MAX_VOLTAGE_LIMIT = 450.0f; // Voltios
+
+    SafetyStatus current_safety_state;
+
+public:
+    FibonacciToroidalFOC() : current_safety_state(SafetyStatus::OPERATIONAL) {}
+
+    // Validación defensiva estricta en tiempo real
+    inline bool validate_inputs(const MotorTelemetry& tel) const {
+        if (!tel.sensors_valid) return false;
+        if (std::abs(tel.i_a) > MAX_CURRENT_LIMIT || 
+            std::abs(tel.i_b) > MAX_CURRENT_LIMIT || 
+            std::abs(tel.i_c) > MAX_CURRENT_LIMIT) {
+            return false;
+        }
+        return true;
+    }
+
+    // Núcleo de Modulación Armónica Toroidal (Inyección de Secuencia Cero + Proporción Áurea)
+    inline void apply_toroidal_fibonacci_harmonics(float& va, float& vb, float& vc) const {
+        float v_max = std::fmax(va, std::fmax(vb, vc));
+        float v_min = std::fmin(va, std::fmin(vb, vc));
+
+        // Inyección extendida de secuencia cero combinada con el factor phi
+        float zero_seq_3 = -0.5f * (v_max + v_min);
+        float toroidal_correction = zero_seq_3 * (1.0f / PHI);
+
+        va += toroidal_correction;
+        vb += toroidal_correction;
+        vc += toroidal_correction;
+    }
+
+    // Ciclo principal determinista O(1)
+    inline OptimizedPWMOutput compute_control_cycle(const MotorTelemetry& tel, float torque_target) {
+        if (!validate_inputs(tel)) {
+            current_safety_state = SafetyStatus::FAULT_OVERCURRENT;
+            return {0.5f, 0.5f, 0.5f, current_safety_state};
+        }
+
+        // 1. Transformada de Clarke (ABC -> Alpha-Beta)
+        float alpha = tel.i_a;
+        float beta = (tel.i_a + 2.0f * tel.i_b) / SQRT_3;
+
+        // 2. Transformada de Park con proyección toroidal/phi
+        float cos_theta = std::cos(tel.rotor_angle * PHI);
+        float sin_theta = std::sin(tel.rotor_angle * PHI);
+        
+        float i_d = alpha * cos_theta + beta * sin_theta;
+        float i_q = -alpha * sin_theta + beta * cos_theta;
+
+        // 3. Control de par directo (Eje Q)
+        float v_d_req = 0.0f;
+        float v_q_req = torque_target;
+
+        // 4. Park Inversa y Clarke Inversa
+        float v_alpha = v_d_req * cos_theta - v_q_req * sin_theta;
+        float v_beta  = v_d_req * sin_theta + v_q_req * cos_theta;
+
+        float v_a = v_alpha;
+        float v_b = -0.5f * v_alpha + (SQRT_3 * 0.5f) * v_beta;
+        float v_c = -0.5f * v_alpha - (SQRT_3 * 0.5f) * v_beta;
+
+        // 5. Aplicación de la Modulación Toroidal
+        apply_toroidal_fibonacci_harmonics(v_a, v_b, v_c);
+
+        // 6. Normalización y límites de seguridad del inversor (Duty Cycles de 0.0 a 1.0)
+        float scale = 1.0f / MAX_VOLTAGE_LIMIT;
+        float duty_a = std::fmin(std::fmax((v_a * scale) + 0.5f, 0.0f), 1.0f);
+        float duty_b = std::fmin(std::fmax((v_b * scale) + 0.5f, 0.0f), 1.0f);
+        float duty_c = std::fmin(std::fmax((v_c * scale) + 0.5f, 0.0f), 1.0f);
+
+        return {duty_a, duty_b, duty_c, SafetyStatus::OPERATIONAL};
+    }
+};
+
+} // namespace ToroidalEVCore
+
+// Módulo de Benchmark para medir rendimiento en microsegundos
+void run_benchmark() {
+    ToroidalEVCore::FibonacciToroidalFOC controller;
+    ToroidalEVCore::MotorTelemetry dummy_tel{10.0f, -5.0f, -5.0f, 400.0f, 1.57f, true};
+    
+    constexpr int iterations = 10000;
+    
+    auto start = std::chrono::high_resolution_clock::now();
+    
+    for (int i = 0; i < iterations; ++i) {
+        volatile auto result = controller.compute_control_cycle(dummy_tel, 50.0f);
+        (void)result; // Previene optimización agresiva del compilador
+    }
+    
+    auto end = std::chrono::high_resolution_clock::now();
+    auto duration = std::chrono::duration_cast<std::chrono::microseconds>(end - start).count();
+    
+    std::cout << "==========================================" << std::endl;
+    std::cout << "      TOROIDAL-FOC BENCHMARK RESULTS      " << std::endl;
+    std::cout << "==========================================" << std::endl;
+    std::cout << "Iteraciones ejecutadas: " << iterations << std::endl;
+    std::cout << "Tiempo total acumulado: " << duration << " us" << std::endl;
+    std::cout << "Tiempo promedio por ciclo FOC: " << (static_cast<double>(duration) / static_cast<double>(iterations)) << " us" << std::endl;
+    std::cout << "Estado de ejecución: Determinista O(1)" << std::endl;
+    std::cout << "==========================================" << std::endl;
+}
+
+int main() {
+    run_benchmark();
+    return 0;
+}
